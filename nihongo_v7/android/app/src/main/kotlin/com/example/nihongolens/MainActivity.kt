@@ -22,21 +22,23 @@ class MainActivity : FlutterActivity() {
     private val WHISPER_CHANNEL = "whisper_channel"
     private lateinit var mediaProjectionManager: MediaProjectionManager
     private var whisperChannel: MethodChannel? = null
+    private var pendingCaptureResult: MethodChannel.Result? = null
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         instance = this
-        mediaProjectionManager = getSystemService(MEDIA_PROJECTION_SERVICE) as MediaProjectionManager
+        mediaProjectionManager =
+            getSystemService(MEDIA_PROJECTION_SERVICE) as MediaProjectionManager
 
-        // Download MLKit model in background
+        // Pre-download MLKit model
         Thread {
             try {
-                val options = com.google.mlkit.nl.translate.TranslatorOptions.Builder()
+                val opts = com.google.mlkit.nl.translate.TranslatorOptions.Builder()
                     .setSourceLanguage(com.google.mlkit.nl.translate.TranslateLanguage.JAPANESE)
                     .setTargetLanguage(com.google.mlkit.nl.translate.TranslateLanguage.ENGLISH)
                     .build()
-                val t = com.google.mlkit.nl.translate.Translation.getClient(options)
-                t.downloadModelIfNeeded()
+                com.google.mlkit.nl.translate.Translation.getClient(opts)
+                    .downloadModelIfNeeded()
             } catch (_: Exception) {}
         }.start()
     }
@@ -44,59 +46,87 @@ class MainActivity : FlutterActivity() {
     override fun configureFlutterEngine(flutterEngine: FlutterEngine) {
         super.configureFlutterEngine(flutterEngine)
 
-        whisperChannel = MethodChannel(flutterEngine.dartExecutor.binaryMessenger, WHISPER_CHANNEL)
+        whisperChannel = MethodChannel(
+            flutterEngine.dartExecutor.binaryMessenger, WHISPER_CHANNEL)
 
         MethodChannel(flutterEngine.dartExecutor.binaryMessenger, CHANNEL)
             .setMethodCallHandler { call, result ->
                 when (call.method) {
+
                     "startOverlay" -> {
                         if (!Settings.canDrawOverlays(this)) {
-                            startActivity(Intent(Settings.ACTION_MANAGE_OVERLAY_PERMISSION,
-                                Uri.parse("package:$packageName")))
+                            startActivity(
+                                Intent(
+                                    Settings.ACTION_MANAGE_OVERLAY_PERMISSION,
+                                    Uri.parse("package:$packageName")
+                                )
+                            )
                             result.success(false)
                             return@setMethodCallHandler
                         }
                         val i = Intent(this, OverlayService::class.java)
                         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O)
-                            startForegroundService(i) else startService(i)
+                            startForegroundService(i)
+                        else startService(i)
                         result.success(true)
                     }
+
                     "startInternalAudioCapture" -> {
-                        startActivityForResult(
-                            mediaProjectionManager.createScreenCaptureIntent(),
-                            REQUEST_PROJECTION
-                        )
+                        // Stop any existing capture first
+                        stopService(Intent(this, AudioCaptureService::class.java))
+                        // Show system screen capture permission dialog
+                        val captureIntent =
+                            mediaProjectionManager.createScreenCaptureIntent()
+                        startActivityForResult(captureIntent, REQUEST_PROJECTION)
                         result.success(true)
                     }
+
                     "stopCapture" -> {
                         stopService(Intent(this, AudioCaptureService::class.java))
                         stopService(Intent(this, OverlayService::class.java))
                         result.success(true)
                     }
-                    "hasOverlayPermission" -> result.success(Settings.canDrawOverlays(this))
+
+                    "hasOverlayPermission" ->
+                        result.success(Settings.canDrawOverlays(this))
+
                     else -> result.notImplemented()
                 }
             }
     }
 
-    fun sendTranslation(japanese: String, english: String) {
-        runOnUiThread {
-            whisperChannel?.invokeMethod("onTranscription", mapOf(
-                "japanese" to japanese,
-                "english" to english
-            ))
+    override fun onActivityResult(
+        requestCode: Int,
+        resultCode: Int,
+        data: Intent?
+    ) {
+        super.onActivityResult(requestCode, resultCode, data)
+
+        if (requestCode == REQUEST_PROJECTION) {
+            if (resultCode == Activity.RESULT_OK && data != null) {
+                // Permission granted — start the capture service immediately
+                val i = Intent(this, AudioCaptureService::class.java).apply {
+                    putExtra("resultCode", resultCode)
+                    putExtra("data", data)
+                }
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O)
+                    startForegroundService(i)
+                else
+                    startService(i)
+            } else {
+                // User denied — update overlay with message
+                OverlayService.latestSubtitle =
+                    "⚠️ Permission denied. Tap STOP then START again and allow screen capture."
+            }
         }
     }
 
-    override fun onActivityResult(requestCode: Int, resultCode: Int, data: Intent?) {
-        super.onActivityResult(requestCode, resultCode, data)
-        if (requestCode == REQUEST_PROJECTION && resultCode == Activity.RESULT_OK && data != null) {
-            val i = Intent(this, AudioCaptureService::class.java).apply {
-                putExtra("resultCode", resultCode)
-                putExtra("data", data)
-            }
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O)
-                startForegroundService(i) else startService(i)
+    fun sendTranslation(japanese: String, english: String) {
+        runOnUiThread {
+            whisperChannel?.invokeMethod(
+                "onTranscription",
+                mapOf("japanese" to japanese, "english" to english)
+            )
         }
     }
 
