@@ -1,0 +1,7 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">Nihongo Lens</string>
+    <string name="accessibility_service_desc">
+        Nihongo Lens Accessibility Service
+    </string>
+</resources>
