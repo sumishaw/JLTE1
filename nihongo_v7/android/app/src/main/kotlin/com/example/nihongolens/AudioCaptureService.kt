@@ -1,269 +1,306 @@
 package com.example.nihongolens
 
-import android.app.*
+import android.app.Activity
+import android.app.Notification
+import android.app.NotificationChannel
+import android.app.NotificationManager
+import android.app.PendingIntent
+import android.app.Service
+import android.content.Context
 import android.content.Intent
-import android.media.*
+import android.graphics.PixelFormat
+import android.media.AudioAttributes
+import android.media.AudioFormat
+import android.media.AudioPlaybackCaptureConfiguration
+import android.media.AudioRecord
+import android.media.MediaRecorder
 import android.media.projection.MediaProjection
 import android.media.projection.MediaProjectionManager
-import android.os.*
-import android.util.Base64
+import android.os.Build
+import android.os.IBinder
 import android.util.Log
+import android.view.Gravity
+import android.view.LayoutInflater
+import android.view.View
+import android.view.WindowManager
+import android.widget.TextView
 import androidx.core.app.NotificationCompat
-import org.json.JSONObject
-import java.io.OutputStreamWriter
-import java.net.HttpURLConnection
-import java.net.URL
-import java.nio.ByteBuffer
-import java.nio.ByteOrder
-import java.util.concurrent.CountDownLatch
-import java.util.concurrent.TimeUnit
 
 class AudioCaptureService : Service() {
 
+    companion object {
+        const val CHANNEL_ID = "nihongo_lens_channel"
+        const val NOTIFICATION_ID = 1001
+
+        const val EXTRA_RESULT_CODE = "result_code"
+        const val EXTRA_DATA = "data"
+    }
+
     private var mediaProjection: MediaProjection? = null
     private var audioRecord: AudioRecord? = null
-    private var isCapturing = false
-    private var captureThread: Thread? = null
-    private val handler = Handler(Looper.getMainLooper())
-    private val audioBuffer = mutableListOf<Short>()
-    private val SAMPLE_RATE = 16000
-    private val CHUNK_SAMPLES = SAMPLE_RATE * 4
 
-    companion object {
-        const val CHANNEL_ID = "nihongo_cap"
-        const val NOTIF_ID = 2
-    }
+    private lateinit var windowManager: WindowManager
+    private var overlayView: View? = null
+    private var overlayText: TextView? = null
+
+    override fun onBind(intent: Intent?): IBinder? = null
 
     override fun onCreate() {
         super.onCreate()
+
         createNotificationChannel()
-        // Must call startForeground within 5 seconds of onCreate on Android 14+
-        startForeground(NOTIF_ID, buildNotification())
+        showOverlay()
+
+        startForeground(
+            NOTIFICATION_ID,
+            createNotification("🎧 Nihongo Lens running...")
+        )
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
-        if (intent?.action == "STOP") {
+
+        // Android restarted service without permission data
+        if (intent == null) {
             stopSelf()
             return START_NOT_STICKY
         }
 
-        val resultCode = intent?.getIntExtra("resultCode", -1) ?: -1
-        val data: Intent? = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
-            intent?.getParcelableExtra("data", Intent::class.java)
-        } else {
-            @Suppress("DEPRECATION") intent?.getParcelableExtra("data")
-        }
+        val resultCode = intent.getIntExtra(EXTRA_RESULT_CODE, Activity.RESULT_CANCELED)
+        val data = intent.getParcelableExtra<Intent>(EXTRA_DATA)
 
-        if (resultCode == -1 || data == null) {
-            Log.e("NihongoLens", "No resultCode or data")
-            updateOverlay("⚠️ Screen capture permission missing. Tap START again.")
+        if (resultCode != Activity.RESULT_OK || data == null) {
+            Log.e("NihongoLens", "Screen capture permission missing")
+            updateOverlay("⚠️ Tap START again and allow screen capture.")
             stopSelf()
             return START_NOT_STICKY
         }
 
-        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.Q) {
-            updateOverlay("⚠️ Android 10+ required")
+        try {
+
+            val projectionManager =
+                getSystemService(Context.MEDIA_PROJECTION_SERVICE)
+                        as MediaProjectionManager
+
+            mediaProjection =
+                projectionManager.getMediaProjection(resultCode, data)
+
+            startAudioCapture()
+
+            updateOverlay("✅ Active! Open any Japanese video now.")
+
+        } catch (e: Exception) {
+
+            Log.e("NihongoLens", "Error starting capture", e)
+
+            updateOverlay("❌ Failed to start capture")
+
             stopSelf()
-            return START_NOT_STICKY
         }
 
-        // Get MediaProjection and start capture on background thread
-        Thread {
-            try {
-                val mgr = getSystemService(MEDIA_PROJECTION_SERVICE) as MediaProjectionManager
-                mediaProjection = mgr.getMediaProjection(resultCode, data)
-                if (mediaProjection == null) {
-                    handler.post { updateOverlay("⚠️ Could not get MediaProjection") }
-                    return@Thread
-                }
-                startCapture()
-            } catch (e: Exception) {
-                Log.e("NihongoLens", "MediaProjection error: ${e.message}")
-                handler.post { updateOverlay("⚠️ Capture setup failed: ${e.message}") }
-            }
-        }.start()
-
-        return START_STICKY
+        return START_NOT_STICKY
     }
 
-    private fun startCapture() {
-        try {
-            val config = AudioPlaybackCaptureConfiguration.Builder(mediaProjection!!)
+    private fun startAudioCapture() {
+
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.Q) {
+            updateOverlay("❌ Android 10+ required")
+            return
+        }
+
+        val config =
+            AudioPlaybackCaptureConfiguration.Builder(mediaProjection!!)
                 .addMatchingUsage(AudioAttributes.USAGE_MEDIA)
                 .addMatchingUsage(AudioAttributes.USAGE_GAME)
                 .addMatchingUsage(AudioAttributes.USAGE_UNKNOWN)
                 .build()
 
-            val minBuf = maxOf(
-                AudioRecord.getMinBufferSize(SAMPLE_RATE, AudioFormat.CHANNEL_IN_MONO, AudioFormat.ENCODING_PCM_16BIT),
-                4096
+        val sampleRate = 16000
+
+        val channelConfig = AudioFormat.CHANNEL_IN_MONO
+
+        val audioFormat = AudioFormat.ENCODING_PCM_16BIT
+
+        val bufferSize = AudioRecord.getMinBufferSize(
+            sampleRate,
+            channelConfig,
+            audioFormat
+        )
+
+        audioRecord = AudioRecord.Builder()
+            .setAudioFormat(
+                AudioFormat.Builder()
+                    .setEncoding(audioFormat)
+                    .setSampleRate(sampleRate)
+                    .setChannelMask(channelConfig)
+                    .build()
             )
+            .setBufferSizeInBytes(bufferSize * 2)
+            .setAudioPlaybackCaptureConfig(config)
+            .build()
 
-            audioRecord = AudioRecord.Builder()
-                .setAudioPlaybackCaptureConfig(config)
-                .setAudioFormat(AudioFormat.Builder()
-                    .setEncoding(AudioFormat.ENCODING_PCM_16BIT)
-                    .setSampleRate(SAMPLE_RATE)
-                    .setChannelMask(AudioFormat.CHANNEL_IN_MONO)
-                    .build())
-                .setBufferSizeInBytes(minBuf * 4)
-                .build()
-
-            if (audioRecord?.state != AudioRecord.STATE_INITIALIZED) {
-                Log.e("NihongoLens", "AudioRecord not initialized, state=${audioRecord?.state}")
-                handler.post { updateOverlay("⚠️ Audio capture init failed") }
-                return
-            }
+        try {
 
             audioRecord?.startRecording()
-            isCapturing = true
-            handler.post { updateOverlay("🎧 Capturing! Open a Japanese video now...") }
-            Log.d("NihongoLens", "AudioRecord started successfully")
 
-            captureThread = Thread {
-                val buf = ShortArray(minBuf / 2)
-                while (isCapturing) {
-                    val read = audioRecord?.read(buf, 0, buf.size) ?: break
-                    if (read > 0) {
-                        synchronized(audioBuffer) {
-                            for (i in 0 until read) audioBuffer.add(buf[i])
-                            if (audioBuffer.size >= CHUNK_SAMPLES) {
-                                val chunk = audioBuffer.toShortArray()
-                                audioBuffer.clear()
-                                processChunk(chunk)
-                            }
+            Log.d("NihongoLens", "Audio capture started")
+
+            Thread {
+
+                val buffer = ByteArray(bufferSize)
+
+                while (audioRecord != null) {
+
+                    try {
+
+                        val read =
+                            audioRecord?.read(buffer, 0, buffer.size) ?: 0
+
+                        if (read > 0) {
+
+                            Log.d(
+                                "NihongoLens",
+                                "Captured audio bytes: $read"
+                            )
+
+                            // TODO:
+                            // Send PCM audio to translation engine
+                            // Example:
+                            // Whisper / Google Translate / Vosk
+
+                            updateOverlay("🎌 Listening to Japanese audio...")
                         }
+
+                    } catch (e: Exception) {
+
+                        Log.e("NihongoLens", "Read error", e)
                     }
                 }
-                Log.d("NihongoLens", "Capture thread ended")
-            }
-            captureThread?.start()
+
+            }.start()
 
         } catch (e: Exception) {
-            Log.e("NihongoLens", "startCapture error: ${e.message}")
-            handler.post { updateOverlay("⚠️ ${e.message}") }
+
+            Log.e("NihongoLens", "Recording failed", e)
+
+            updateOverlay("❌ Audio capture failed")
         }
     }
 
-    private fun processChunk(samples: ShortArray) {
-        // RMS energy check - skip silence
-        var sum = 0.0
-        for (s in samples) sum += s.toLong() * s
-        val rms = Math.sqrt(sum / samples.size)
-        Log.d("NihongoLens", "Chunk RMS: $rms")
-        if (rms < 100) return
+    private fun showOverlay() {
 
-        val bytes = ByteBuffer.allocate(samples.size * 2)
-            .order(ByteOrder.LITTLE_ENDIAN)
-            .also { b -> samples.forEach { b.putShort(it) } }
-            .array()
+        windowManager =
+            getSystemService(WINDOW_SERVICE) as WindowManager
 
-        Thread {
-            try {
-                Log.d("NihongoLens", "Sending ${bytes.size} bytes to STT")
-                val japanese = googleStt(bytes)
-                Log.d("NihongoLens", "STT result: $japanese")
-                if (!japanese.isNullOrBlank()) {
-                    handler.post { updateOverlay("🔄 $japanese", isPartial = true) }
-                    val english = mlkitTranslate(japanese)
-                    Log.d("NihongoLens", "Translation: $english")
-                    handler.post {
-                        updateOverlay(english, japanese = japanese)
-                        MainActivity.instance?.sendTranslation(japanese, english)
-                    }
-                }
-            } catch (e: Exception) {
-                Log.e("NihongoLens", "processChunk error: ${e.message}")
-            }
-        }.start()
-    }
+        overlayView = LayoutInflater.from(this)
+            .inflate(R.layout.overlay_layout, null)
 
-    private fun googleStt(pcmBytes: ByteArray): String? {
-        return try {
-            val b64 = Base64.encodeToString(pcmBytes, Base64.NO_WRAP)
-            val body = """{"config":{"encoding":"LINEAR16","sampleRateHertz":$SAMPLE_RATE,"languageCode":"ja-JP","maxAlternatives":1},"audio":{"content":"$b64"}}"""
-            val url = URL("https://speech.googleapis.com/v1/speech:recognize?key=AIzaSyBOti4mM-6x9WDnZIjIeyEU21OpBXqWBgw")
-            val conn = (url.openConnection() as HttpURLConnection).apply {
-                requestMethod = "POST"
-                setRequestProperty("Content-Type", "application/json")
-                doOutput = true
-                connectTimeout = 15000
-                readTimeout = 15000
-            }
-            OutputStreamWriter(conn.outputStream).use { it.write(body) }
-            val code = conn.responseCode
-            Log.d("NihongoLens", "STT HTTP $code")
-            if (code == 200) {
-                val resp = conn.inputStream.bufferedReader().readText()
-                Log.d("NihongoLens", "STT response: $resp")
-                JSONObject(resp).optJSONArray("results")
-                    ?.getJSONObject(0)?.optJSONArray("alternatives")
-                    ?.getJSONObject(0)?.optString("transcript")
-            } else {
-                val err = conn.errorStream?.bufferedReader()?.readText()
-                Log.e("NihongoLens", "STT error body: $err")
-                null
-            }
+        overlayText =
+            overlayView?.findViewById(R.id.overlayText)
+
+        val params = WindowManager.LayoutParams(
+            WindowManager.LayoutParams.WRAP_CONTENT,
+            WindowManager.LayoutParams.WRAP_CONTENT,
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O)
+                WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY
+            else
+                WindowManager.LayoutParams.TYPE_PHONE,
+            WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or
+                    WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN,
+            PixelFormat.TRANSLUCENT
+        )
+
+        params.gravity = Gravity.TOP or Gravity.CENTER_HORIZONTAL
+        params.x = 0
+        params.y = 120
+
+        try {
+
+            windowManager.addView(overlayView, params)
+
         } catch (e: Exception) {
-            Log.e("NihongoLens", "STT exception: ${e.message}")
-            null
+
+            Log.e("NihongoLens", "Overlay error", e)
         }
     }
 
-    private fun mlkitTranslate(japanese: String): String {
-        return try {
-            val options = com.google.mlkit.nl.translate.TranslatorOptions.Builder()
-                .setSourceLanguage(com.google.mlkit.nl.translate.TranslateLanguage.JAPANESE)
-                .setTargetLanguage(com.google.mlkit.nl.translate.TranslateLanguage.ENGLISH)
-                .build()
-            val translator = com.google.mlkit.nl.translate.Translation.getClient(options)
-            var result = japanese
-            val latch = CountDownLatch(1)
-            translator.translate(japanese)
-                .addOnSuccessListener { r -> result = r; latch.countDown() }
-                .addOnFailureListener { latch.countDown() }
-            latch.await(8, TimeUnit.SECONDS)
-            translator.close()
-            result
-        } catch (e: Exception) {
-            Log.e("NihongoLens", "MLKit error: ${e.message}")
-            japanese
+    private fun updateOverlay(text: String) {
+
+        overlayView?.post {
+
+            overlayText?.text = text
         }
     }
 
-    private fun updateOverlay(text: String, japanese: String = "", isPartial: Boolean = false) {
-        OverlayService.latestSubtitle = text
-        if (japanese.isNotEmpty()) OverlayService.latestJapanese = japanese
-    }
+    private fun createNotification(text: String): Notification {
 
-    private fun createNotificationChannel() {
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-            NotificationChannel(CHANNEL_ID, "Audio Capture", NotificationManager.IMPORTANCE_LOW)
-                .apply { setShowBadge(false) }
-                .also { getSystemService(NotificationManager::class.java).createNotificationChannel(it) }
-        }
-    }
+        val stopIntent = Intent(this, AudioCaptureService::class.java)
+        stopIntent.action = "STOP"
 
-    private fun buildNotification(): Notification {
-        val stopPi = PendingIntent.getService(this, 0,
-            Intent(this, AudioCaptureService::class.java).apply { action = "STOP" },
-            PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT)
+        val stopPendingIntent = PendingIntent.getService(
+            this,
+            0,
+            stopIntent,
+            PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT
+        )
+
         return NotificationCompat.Builder(this, CHANNEL_ID)
-            .setContentTitle("🎌 Nihongo Lens")
-            .setContentText("Translating Japanese audio...")
+            .setContentTitle("Nihongo Lens")
+            .setContentText(text)
             .setSmallIcon(android.R.drawable.ic_btn_speak_now)
             .setOngoing(true)
-            .addAction(android.R.drawable.ic_delete, "Stop", stopPi)
+            .addAction(
+                android.R.drawable.ic_delete,
+                "STOP",
+                stopPendingIntent
+            )
             .build()
     }
 
-    override fun onDestroy() {
-        isCapturing = false
-        captureThread?.join(500)
-        try { audioRecord?.stop(); audioRecord?.release() } catch (_: Exception) {}
-        try { mediaProjection?.stop() } catch (_: Exception) {}
-        super.onDestroy()
+    private fun createNotificationChannel() {
+
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+
+            val channel = NotificationChannel(
+                CHANNEL_ID,
+                "Nihongo Lens",
+                NotificationManager.IMPORTANCE_LOW
+            )
+
+            val manager =
+                getSystemService(NotificationManager::class.java)
+
+            manager.createNotificationChannel(channel)
+        }
     }
 
-    override fun onBind(intent: Intent?): IBinder? = null
+    override fun onDestroy() {
+        super.onDestroy()
+
+        try {
+
+            audioRecord?.stop()
+            audioRecord?.release()
+            audioRecord = null
+
+        } catch (_: Exception) {
+        }
+
+        try {
+
+            mediaProjection?.stop()
+            mediaProjection = null
+
+        } catch (_: Exception) {
+        }
+
+        try {
+
+            if (overlayView != null) {
+                windowManager.removeView(overlayView)
+                overlayView = null
+            }
+
+        } catch (_: Exception) {
+        }
+    }
 }
